@@ -478,8 +478,8 @@ class WALManager:
                         record_type=LogRecordType.CLR,
                         prev_lsn=prev_lsn,
                         page_id=record.page_id,
-                        before_image=record.before_image,
-                        after_image=record.after_image,
+                        before_image=record.after_image,
+                        after_image=record.before_image,
                         undo_next_lsn=record.prev_lsn
                     )
 
@@ -817,8 +817,8 @@ class WALManager:
                             record_type=LogRecordType.CLR,
                             prev_lsn=prev_lsn,
                             page_id=record.page_id,
-                            before_image=record.before_image,
-                            after_image=record.after_image,
+                            before_image=record.after_image,
+                            after_image=record.before_image,
                             undo_next_lsn=record.prev_lsn
                         )
 
