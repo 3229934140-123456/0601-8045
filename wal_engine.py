@@ -42,6 +42,7 @@ class LogRecord:
     page_id: Optional[int] = None    # 涉及的数据页ID (UPDATE类型使用)
     before_image: Optional[Dict[str, Any]] = None  # 修改前的数据镜像 (用于UNDO)
     after_image: Optional[Dict[str, Any]] = None   # 修改后的数据镜像 (用于REDO)
+    undo_next_lsn: Optional[int] = None  # CLR专用: 下一个需要撤销的LSN (跳过已撤销的操作)
     checkpoint_lsns: Optional[List[int]] = None  # 检查点相关LSN列表 (CHECKPOINT_END使用)
     checksum: int = 0            # 校验和
 
@@ -55,6 +56,7 @@ class LogRecord:
             'page_id': self.page_id,
             'before_image': self.before_image,
             'after_image': self.after_image,
+            'undo_next_lsn': self.undo_next_lsn,
             'checkpoint_lsns': self.checkpoint_lsns,
         }
         payload = pickle.dumps(data)
@@ -82,6 +84,7 @@ class LogRecord:
             page_id=obj['page_id'],
             before_image=obj['before_image'],
             after_image=obj['after_image'],
+            undo_next_lsn=obj.get('undo_next_lsn'),
             checkpoint_lsns=obj['checkpoint_lsns'],
             checksum=int.from_bytes(checksum_stored, 'little')
         )
@@ -437,56 +440,69 @@ class WALManager:
 
     def _undo_transaction(self, txn_id: int):
         """
-        执行事务的UNDO操作
+        执行事务的UNDO操作 (ARIES风格)
 
-        通过反向遍历日志链进行撤销
+        从事务last_lsn开始沿日志链反向遍历:
+        - 遇到UPDATE: 写CLR(含undo_next_lsn=该UPDATE的prev_lsn)，用before_image恢复页面
+        - 遇到CLR: 跳到其undo_next_lsn继续(之前已撤销的操作不再重复)
+        - 遇到BEGIN: 停止
 
-        关键：使用prev_lsn链反向遍历同一事务的日志
+        撤销顺序: 最新操作先撤销，保证同一页多次修改时最终回到事务前原始值
         """
         logs_by_lsn: Dict[int, LogRecord] = {}
-        self._scan_wal_from(self._checkpoint_lsn, logs_by_lsn)
+        self._scan_wal_from(0, logs_by_lsn)
 
-        undo_stack = []
         if txn_id in self._transaction_table:
-            last_lsn = self._transaction_table[txn_id].last_lsn
+            current_lsn = self._transaction_table[txn_id].last_lsn
         else:
-            last_lsn = self._txn_prev_lsn.get(txn_id, 0)
+            current_lsn = self._txn_prev_lsn.get(txn_id, 0)
 
-        current_lsn = last_lsn
-        while current_lsn != 0 and current_lsn in logs_by_lsn:
+        visited = set()
+        while current_lsn != 0 and current_lsn not in visited:
+            visited.add(current_lsn)
+            if current_lsn not in logs_by_lsn:
+                break
             record = logs_by_lsn[current_lsn]
-            if record.txn_id == txn_id:
-                if record.record_type == LogRecordType.UPDATE:
-                    undo_stack.append(record)
-                current_lsn = record.prev_lsn
-            else:
+
+            if record.txn_id != txn_id:
                 break
 
-        for record in reversed(undo_stack):
-            if record.record_type == LogRecordType.UPDATE and record.page_id is not None:
-                clr_lsn = self._allocate_lsn()
-                prev_lsn = self._txn_prev_lsn.get(txn_id, 0)
+            if record.record_type == LogRecordType.UPDATE:
+                if record.page_id is not None and record.before_image is not None:
+                    clr_lsn = self._allocate_lsn()
+                    prev_lsn = self._txn_prev_lsn.get(txn_id, 0)
 
-                clr_record = LogRecord(
-                    lsn=clr_lsn,
-                    txn_id=txn_id,
-                    record_type=LogRecordType.CLR,
-                    prev_lsn=prev_lsn,
-                    page_id=record.page_id,
-                    before_image=record.before_image,
-                    after_image=record.after_image
-                )
+                    clr_record = LogRecord(
+                        lsn=clr_lsn,
+                        txn_id=txn_id,
+                        record_type=LogRecordType.CLR,
+                        prev_lsn=prev_lsn,
+                        page_id=record.page_id,
+                        before_image=record.before_image,
+                        after_image=record.after_image,
+                        undo_next_lsn=record.prev_lsn
+                    )
 
-                self._append_log(clr_record)
+                    self._append_log(clr_record)
 
-                if record.before_image is not None:
                     self.page_store.write_page(
                         record.page_id,
                         record.before_image,
                         clr_lsn
                     )
 
-                self._txn_prev_lsn[txn_id] = clr_lsn
+                    self._txn_prev_lsn[txn_id] = clr_lsn
+
+                current_lsn = record.prev_lsn
+
+            elif record.record_type == LogRecordType.CLR:
+                current_lsn = record.undo_next_lsn if record.undo_next_lsn is not None else record.prev_lsn
+
+            elif record.record_type == LogRecordType.BEGIN:
+                break
+
+            else:
+                current_lsn = record.prev_lsn
 
     def flush_pages_with_wal_guarantee(self, page_id: int):
         """
@@ -536,11 +552,12 @@ class WALManager:
             self._flush_wal(begin_lsn)
 
             checkpoint_txn_table = copy.deepcopy(self._transaction_table)
-            checkpoint_dirty_table = copy.deepcopy(self._dirty_page_table)
 
             dirty_pages = list(self._dirty_page_table.keys())
             for page_id in dirty_pages:
                 self.flush_pages_with_wal_guarantee(page_id)
+
+            checkpoint_dirty_table = copy.deepcopy(self._dirty_page_table)
 
             checkpoint_data = {
                 'txn_table': {tid: e.__dict__ for tid, e in checkpoint_txn_table.items()},
@@ -605,27 +622,44 @@ class WALManager:
         records.sort(key=lambda x: x[0])
         return records
 
+    def _ensure_lsn_loaded(self, lsn: int, logs_by_lsn: Dict[int, LogRecord]) -> bool:
+        """
+        确保指定LSN的日志记录已加载到logs_by_lsn中
+
+        如果不在，则从WAL文件头部开始扫描补充加载
+        返回是否成功找到该记录
+        """
+        if lsn in logs_by_lsn:
+            return True
+        if lsn == 0:
+            return False
+        print(f"  [回溯加载] LSN={lsn} 不在已扫描范围内，从文件头部补充加载...")
+        self._scan_wal_from(0, logs_by_lsn)
+        return lsn in logs_by_lsn
+
     def recover(self):
         """
-        崩溃恢复
+        崩溃恢复 (ARIES算法)
 
         恢复算法三阶段：
 
         阶段1 - 分析阶段(Analysis Pass):
-        - 找到最后一个有效检查点
-        - 重建事务表和脏页表
-        - 确定重做起点(redo_lsn)
+        - 从最后一个有效检查点开始
+        - 加载检查点保存的事务表和脏页表
+        - 只从检查点之后正向扫描日志，重建状态
+        - 确定重做起点(redo_lsn)和失败者事务集合
 
         阶段2 - 重做阶段(Redo Pass):
-        - 从redo_lsn开始重放所有日志
+        - 从redo_lsn开始重放所有UPDATE/CLR日志
         - 重做所有更新(包括未提交事务的更新)
-        - 保证已提交和未提交的修改都重做
+        - 检查点已刷盘的页面会被page_lsn检查自动跳过
 
         阶段3 - 撤销阶段(Undo Pass):
         - 找出所有未提交的失败者事务
-        - 反向遍历UNDO每个失败者事务
-        - 使用before_image恢复数据
-        - 写入CLR和ROLLBACK日志
+        - 沿日志链反向遍历，遇到CLR跳到undo_next_lsn
+        - 对每条UPDATE写CLR并应用before_image
+        - 如果prev_lsn链回溯到检查点之前的记录，自动回溯加载
+        - 最终写ROLLBACK日志
         """
         print("=" * 60)
         print("开始崩溃恢复...")
@@ -638,28 +672,45 @@ class WALManager:
         print("\n[阶段1] 分析阶段 - 重建事务状态")
         print("-" * 60)
 
+        if self._checkpoint_lsn > 0 and os.path.exists(self.checkpoint_file):
+            try:
+                with open(self.checkpoint_file, 'rb') as f:
+                    checkpoint_data = pickle.load(f)
+                for tid, entry_data in checkpoint_data.get('txn_table', {}).items():
+                    self._transaction_table[tid] = TransactionTableEntry(**entry_data)
+                for pid, entry_data in checkpoint_data.get('dirty_page_table', {}).items():
+                    self._dirty_page_table[pid] = DirtyPageTableEntry(**entry_data)
+                print(f"从检查点加载: {len(self._transaction_table)} 事务, {len(self._dirty_page_table)} 脏页")
+            except Exception as e:
+                print(f"加载检查点文件失败: {e}, 从头开始恢复")
+                self._transaction_table.clear()
+                self._dirty_page_table.clear()
+
+        scan_start = max(1, self._checkpoint_lsn) if self._checkpoint_lsn > 0 else 0
         logs_by_lsn: Dict[int, LogRecord] = {}
-        all_records = self._scan_wal_from(0, logs_by_lsn)
+        all_records = self._scan_wal_from(scan_start, logs_by_lsn)
+        scan_count_from_file = len(all_records)
+        print(f"从LSN={scan_start}扫描, 加载 {scan_count_from_file} 条日志记录")
 
-        if self._checkpoint_lsn > 0 and self._checkpoint_lsn in logs_by_lsn:
-            checkpoint_record = logs_by_lsn[self._checkpoint_lsn]
-            if checkpoint_record.record_type == LogRecordType.CHECKPOINT_END:
-                print(f"找到有效检查点，LSN={self._checkpoint_lsn}")
+        if self._checkpoint_lsn > 0:
+            valid_checkpoint = False
+            if self._checkpoint_lsn in logs_by_lsn:
+                ckpt_rec = logs_by_lsn[self._checkpoint_lsn]
+                if ckpt_rec.record_type == LogRecordType.CHECKPOINT_END:
+                    valid_checkpoint = True
+                    print(f"找到有效检查点，LSN={self._checkpoint_lsn}")
+            if not valid_checkpoint:
+                print("检查点无效，从日志开头重新扫描")
+                self._transaction_table.clear()
+                self._dirty_page_table.clear()
+                logs_by_lsn.clear()
+                all_records = self._scan_wal_from(0, logs_by_lsn)
 
-                if os.path.exists(self.checkpoint_file):
-                    try:
-                        with open(self.checkpoint_file, 'rb') as f:
-                            checkpoint_data = pickle.load(f)
-                        for tid, entry_data in checkpoint_data.get('txn_table', {}).items():
-                            self._transaction_table[tid] = TransactionTableEntry(**entry_data)
-                        for pid, entry_data in checkpoint_data.get('dirty_page_table', {}).items():
-                            self._dirty_page_table[pid] = DirtyPageTableEntry(**entry_data)
-                        print(f"从检查点加载: {len(self._transaction_table)} 事务, {len(self._dirty_page_table)} 脏页")
-                    except Exception as e:
-                        print(f"加载检查点文件失败: {e}, 从头开始恢复")
-
-        redo_lsn = min([e.rec_lsn for e in self._dirty_page_table.values()], default=self._checkpoint_lsn + 1)
-        if self._checkpoint_lsn == 0:
+        if self._dirty_page_table:
+            redo_lsn = min(e.rec_lsn for e in self._dirty_page_table.values())
+        elif self._checkpoint_lsn > 0:
+            redo_lsn = self._checkpoint_lsn + 1
+        else:
             redo_lsn = 1
         print(f"重做起点 LSN: {redo_lsn}")
 
@@ -668,22 +719,24 @@ class WALManager:
             if record.txn_id == 0:
                 continue
             if record.record_type == LogRecordType.BEGIN:
-                if record.txn_id not in self._transaction_table:
-                    self._transaction_table[record.txn_id] = TransactionTableEntry(
-                        txn_id=record.txn_id,
-                        status='active',
-                        last_lsn=record.lsn
-                    )
-                    loser_txns.add(record.txn_id)
+                self._transaction_table[record.txn_id] = TransactionTableEntry(
+                    txn_id=record.txn_id,
+                    status='active',
+                    last_lsn=record.lsn
+                )
+                loser_txns.add(record.txn_id)
             elif record.record_type == LogRecordType.UPDATE:
                 if record.txn_id in self._transaction_table:
                     self._transaction_table[record.txn_id].last_lsn = record.lsn
-                if record.page_id is not None:
-                    if record.page_id not in self._dirty_page_table:
-                        self._dirty_page_table[record.page_id] = DirtyPageTableEntry(
-                            page_id=record.page_id,
-                            rec_lsn=record.lsn
-                        )
+                else:
+                    self._transaction_table[record.txn_id] = TransactionTableEntry(
+                        txn_id=record.txn_id, status='active', last_lsn=record.lsn
+                    )
+                    loser_txns.add(record.txn_id)
+                if record.page_id is not None and record.page_id not in self._dirty_page_table:
+                    self._dirty_page_table[record.page_id] = DirtyPageTableEntry(
+                        page_id=record.page_id, rec_lsn=record.lsn
+                    )
             elif record.record_type == LogRecordType.COMMIT:
                 if record.txn_id in self._transaction_table:
                     self._transaction_table[record.txn_id].status = 'committed'
@@ -712,16 +765,14 @@ class WALManager:
                 continue
             if record.record_type in (LogRecordType.UPDATE, LogRecordType.CLR):
                 if record.page_id is not None and record.after_image is not None:
-                    page = self.page_store.read_page(record.page_id)
                     page_lsn = self.page_store.get_page_lsn(record.page_id)
                     if page_lsn < record.lsn:
-                        print(f"  REDO LSN={record.lsn} 页={record.page_id}")
+                        print(f"  REDO LSN={record.lsn} 页={record.page_id} 类型={record.record_type.name}")
                         self.page_store.write_page(record.page_id, record.after_image, record.lsn)
                         redo_count += 1
                         if record.page_id not in self._dirty_page_table:
                             self._dirty_page_table[record.page_id] = DirtyPageTableEntry(
-                                page_id=record.page_id,
-                                rec_lsn=record.lsn
+                                page_id=record.page_id, rec_lsn=record.lsn
                             )
 
         print(f"重做完成: 共重放 {redo_count} 条更新记录")
@@ -734,44 +785,75 @@ class WALManager:
         undo_count = 0
         for txn_id in loser_list:
             print(f"\n撤销事务 Txn={txn_id}")
-            undo_stack = []
             if txn_id in self._transaction_table:
-                last_lsn = self._transaction_table[txn_id].last_lsn
+                current_lsn = self._transaction_table[txn_id].last_lsn
             else:
-                last_lsn = 0
-                for lsn, rec in reversed(all_records):
-                    if rec.txn_id == txn_id and rec.record_type != LogRecordType.BEGIN:
-                        last_lsn = max(last_lsn, lsn)
+                current_lsn = 0
 
-            current_lsn = last_lsn
             visited = set()
             while current_lsn != 0 and current_lsn not in visited:
                 visited.add(current_lsn)
-                if current_lsn in logs_by_lsn:
-                    record = logs_by_lsn[current_lsn]
-                    if record.txn_id == txn_id:
-                        if record.record_type in (LogRecordType.UPDATE,):
-                            undo_stack.append(record)
-                        current_lsn = record.prev_lsn
-                    else:
+
+                if current_lsn not in logs_by_lsn:
+                    if not self._ensure_lsn_loaded(current_lsn, logs_by_lsn):
+                        print(f"  无法加载 LSN={current_lsn}, 停止撤销")
                         break
-                else:
+
+                record = logs_by_lsn[current_lsn]
+
+                if record.txn_id != txn_id:
                     break
 
-            for record in undo_stack:
-                if record.record_type == LogRecordType.UPDATE and record.page_id is not None and record.before_image is not None:
-                    print(f"  UNDO LSN={record.lsn} 页={record.page_id}")
-                    self.page_store.write_page(record.page_id, record.before_image, 0)
-                    undo_count += 1
+                if record.record_type == LogRecordType.UPDATE:
+                    if record.page_id is not None and record.before_image is not None:
+                        clr_lsn = self._allocate_lsn()
+                        prev_lsn = 0
+                        if txn_id in self._transaction_table:
+                            prev_lsn = self._transaction_table[txn_id].last_lsn
+
+                        clr_record = LogRecord(
+                            lsn=clr_lsn,
+                            txn_id=txn_id,
+                            record_type=LogRecordType.CLR,
+                            prev_lsn=prev_lsn,
+                            page_id=record.page_id,
+                            before_image=record.before_image,
+                            after_image=record.after_image,
+                            undo_next_lsn=record.prev_lsn
+                        )
+
+                        self._append_log(clr_record)
+                        print(f"  UNDO->CLR LSN={clr_lsn} 页={record.page_id} (撤销LSN={record.lsn})")
+
+                        self.page_store.write_page(record.page_id, record.before_image, clr_lsn)
+                        undo_count += 1
+
+                        if txn_id in self._transaction_table:
+                            self._transaction_table[txn_id].last_lsn = clr_lsn
+
+                    current_lsn = record.prev_lsn
+
+                elif record.record_type == LogRecordType.CLR:
+                    next_lsn = record.undo_next_lsn if record.undo_next_lsn is not None else record.prev_lsn
+                    print(f"  跳过已有CLR LSN={record.lsn} -> undo_next_lsn={next_lsn}")
+                    current_lsn = next_lsn
+
+                elif record.record_type == LogRecordType.BEGIN:
+                    break
+
+                else:
+                    current_lsn = record.prev_lsn
 
             rollback_lsn = self._allocate_lsn()
+            last_txn_lsn = self._transaction_table[txn_id].last_lsn if txn_id in self._transaction_table else 0
             rollback_record = LogRecord(
                 lsn=rollback_lsn,
                 txn_id=txn_id,
                 record_type=LogRecordType.ROLLBACK,
-                prev_lsn=last_lsn
+                prev_lsn=last_txn_lsn
             )
             self._append_log(rollback_record)
+            print(f"  写入ROLLBACK LSN={rollback_lsn}")
 
             if txn_id in self._transaction_table:
                 self._transaction_table[txn_id].status = 'aborted'
